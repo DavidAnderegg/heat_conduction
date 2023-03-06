@@ -35,33 +35,33 @@ def main():
 
     # mesh definition
     n_cells = 10
+
     mesh = (np.cos(np.linspace(np.pi, 0, n_cells+1)) + 1 )/2
     # mesh = np.linspace(0, 1, n_cells+1)
 
     # values at mesh-points
+    def c(x):
+        return 0.5 - x*(0.5-0.1)
+    # conductivity = c(mesh)
     conductivity = np.ones(n_cells+1) * 1
-    # radius = np.ones(n_cells+1) * 1
+
     def r(x):
-        a = 0.5-0.1
-        r = 0.5 - x*a
-        return r
-    # radius = np.linspace(0.5, 0.1, n_cells+1)
-    radius = r(mesh)
-    # radius = np.linspace(0.1, 0.5, n_cells+1)
+        return 0.5 - x*(0.5-0.1)
+    # radius = r(mesh)
+    radius = np.ones(n_cells+1) * 1
 
     # Boundary definition
     BCs = [
         ['dirichlet', 100],
         # ['neumann', 0.01],
         ['dirichlet', 50],
-        # ['dirichlet', 100],
-        # ['neumann', 1],
+        # ['neumann', 0.1],
     ]
 
     # Numerical method
-    solver = 'numpy.linalg.solve'
+    # solver = 'numpy.linalg.solve'
     # solver = 'jacobi'
-    # solver = 'gauss-seidel'
+    solver = 'gauss-seidel'
     max_n = 1e4
     rel_conv_tolerance = 1e-12
 
@@ -83,7 +83,7 @@ def main():
 
 
     # Assemble matrices and vectors
-    A = assemble_A(n_cells, conductivity_h, area_h, x_cell_h)
+    A = assemble_A(n_cells, conductivity_h, area_h, dx_h)
     B = np.zeros(n_cells)
     T_h = np.zeros(n_cells+2)
 
@@ -104,8 +104,14 @@ def main():
     fig, axs = plt.subplots(3, 1)
 
     plot_problem(axs[0], mesh_h, conductivity_h, radius_h, BCs)
+    # if possilbe, plot analytic solution
+    if BCs[0][0] == 'dirichlet' and \
+       BCs[1][0] == 'dirichlet' and \
+       np.all(conductivity == conductivity[0]) and \
+       np.all(radius == radius[0]):
+        plot_analytic(axs[1], BCs, mesh_h)
+
     plot_temp(axs[1], T_h, x_cell_h, mesh_h)
-    # plot_analytic(axs[1], BCs, mesh_h)
     plot_res(axs[2], R_norm_hist)
 
     fig.suptitle(f'Solver: {solver}')
@@ -214,7 +220,7 @@ def calc_res_norm(R_scaled):
 
     return R_norm
 
-def assemble_A(n_cells, conductivity_h, area_h, x_cell_h):
+def assemble_A(n_cells, conductivity_h, area_h, dx_h):
     A = np.zeros((n_cells, n_cells))
     for i in range(n_cells):
         i_h = i + 1
@@ -222,9 +228,8 @@ def assemble_A(n_cells, conductivity_h, area_h, x_cell_h):
         # prepare values for neighboring cells
         left_cell, right_cell = 0, 0
 
-        left_cell   = conductivity_h[i_h] * area_h[i_h] / (x_cell_h[i_h] - x_cell_h[i_h-1])
-        right_cell  = conductivity_h[i_h+1] * area_h[i_h+1] / (x_cell_h[i_h +1] - x_cell_h[i_h])
-
+        left_cell   = conductivity_h[i_h] * area_h[i_h] / dx_h[i]
+        right_cell  = conductivity_h[i_h+1] * area_h[i_h+1] / dx_h[i+1]
 
         # assemble equation for current cell
         if i > 0:
@@ -246,7 +251,7 @@ def set_T_halo(BCs, T_h, dx_h):
         dT_dx = (T_h[2] - T_h[1]) / dx_h[1]
 
         # set temp in halo cells
-        T_h[0] = BCs[left][value] - dT_dx * dx_h[0]
+        T_h[0] = BCs[left][value] - dT_dx * dx_h[0]/2
 
     elif BCs[left][name] == 'neumann':
         T_h[0] = -2*BCs[left][value] + T_h[1]
@@ -257,7 +262,7 @@ def set_T_halo(BCs, T_h, dx_h):
         dT_dx = (T_h[-2] - T_h[-3]) / dx_h[-2]
 
         # set temp in halo cells
-        T_h[-1]= BCs[right][value] + dT_dx * dx_h[-1]
+        T_h[-1]= BCs[right][value] + dT_dx * dx_h[-1]/2
 
     elif BCs[right][name] == 'neumann':
         T_h[-1] = +2*BCs[right][value] + T_h[-2]
@@ -352,7 +357,6 @@ def plot_problem(ax, mesh_h, conductivity_h, radius_h, BCs):
     ax.set_ylabel('y-position [m]')
     ax_2.set_ylabel('conductivity')
 
-
 def plot_temp(ax, T_h, x_cell_h, mesh_h):
     # plot temp
     p = ax.plot(x_cell_h[1:-1], T_h[1:-1], '.-')
@@ -373,8 +377,6 @@ def plot_temp(ax, T_h, x_cell_h, mesh_h):
     ax.set_title('Temp distribution')
     ax.set_xlabel('x-position [m]')
     ax.set_ylabel('Temperature [°K]')
-
-
 
 def plot_res(ax, R_norm_hist):
     ax.plot(R_norm_hist)
@@ -399,11 +401,11 @@ def plot_analytic(ax, BCs, mesh_h):
     T_l = BCs[0][1]
     T_r = BCs[1][1]
 
-    l = mesh_h[-1] - mesh_h[0]
+    l = mesh_h[-2] - mesh_h[1]
     x = np.linspace(0, l, 100)
     T = (T_r - T_l) / l * x + T_l
 
-    ax.plot(x+mesh_h[0], T, '--', label='Analytic')
+    ax.plot(x+mesh_h[1], T, '--', label='Analytic')
 
 
 
