@@ -34,7 +34,7 @@ def main():
     # -------------------------------------------------
 
     # mesh definition
-    n_cells = 10
+    n_cells = 5
 
     mesh = (np.cos(np.linspace(np.pi, 0, n_cells+1)) + 1 )/2
     # mesh = np.linspace(0, 1, n_cells+1)
@@ -61,7 +61,8 @@ def main():
     # Numerical method
     # solver = 'numpy.linalg.solve'
     # solver = 'jacobi'
-    solver = 'gauss-seidel'
+    # solver = 'gauss-seidel'
+    solver = 'thomas'
     max_n = 1e4
     rel_conv_tolerance = 1e-12
 
@@ -145,6 +146,9 @@ def solve(
             T_h[1:-1] = jacobi_step(A, B_BCs, T_h[1:-1])
         elif solver == 'gauss-seidel':
             T_h[1:-1] = gauss_seidel_step(A, B_BCs, T_h[1:-1])
+        elif solver == 'thomas':
+            T_h[1:-1] = thomas_step(A, B_BCs, T_h[1:-1])
+
 
         elif solver == 'numpy.linalg.solve':
             T_h[1:-1] = np.linalg.solve(A, B_BCs)
@@ -204,6 +208,32 @@ def gauss_seidel_step(A, B, T):
 
     return T
 
+def thomas_step(A, B, T):
+
+    # copy matrices
+    AA = copy.copy(A)
+    BB = copy.copy(B)
+
+    # forward elimination phase
+    for k in range(1, len(T)):
+        # ak = k, k-1
+        # bk-1 = k-1, k-1
+        # ck-1 = k-1, k
+
+        m = AA[k, k-1]/AA[k-1, k-1]
+
+        AA[k, k] -= m*AA[k-1, k]
+        BB[k] -= m*BB[k-1]
+
+    # backwards substitution
+    T[-1] = BB[-1] / AA[-1, -1]
+
+    for k in range(len(T)-2, -1, -1):
+        # ck = k, k+1
+
+        T[k] = (BB[k] - AA[k, k+1]*T[k+1]) / AA[k, k]
+
+    return T
 
 
 def calc_res(A, B_BCs, T, mesh):
@@ -396,8 +426,6 @@ def plot_mesh_lines(ax, mesh_h):
     for n in range(1, len(mesh_h)-1):
         x = np.ones(2) * mesh_h[n]
         ax.plot(x, y, '--', color='lightgray')
-
-
 
 def plot_analytic(ax, BCs, mesh_h):
 
