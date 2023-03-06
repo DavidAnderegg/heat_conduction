@@ -114,6 +114,8 @@ def main():
     plot_temp(axs[1], T_h, x_cell_h, mesh_h)
     plot_res(axs[2], R_norm_hist)
 
+    axs[1].legend()
+
     fig.suptitle(f'Solver: {solver}')
     fig.set_figwidth(10)
     fig.set_figheight(10)
@@ -359,7 +361,8 @@ def plot_problem(ax, mesh_h, conductivity_h, radius_h, BCs):
 
 def plot_temp(ax, T_h, x_cell_h, mesh_h):
     # plot temp
-    p = ax.plot(x_cell_h[1:-1], T_h[1:-1], '.-')
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    p = ax.plot(x_cell_h[1:-1], T_h[1:-1], '.-', color=colors[0], label='Numeric')
     color = p[-1].get_color()
 
     # plot value at left boundary
@@ -405,7 +408,8 @@ def plot_analytic(ax, BCs, mesh_h):
     x = np.linspace(0, l, 100)
     T = (T_r - T_l) / l * x + T_l
 
-    ax.plot(x+mesh_h[1], T, '--', label='Analytic')
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    ax.plot(x+mesh_h[1], T, '--', color=colors[1], label='Analytic')
 
 
 
