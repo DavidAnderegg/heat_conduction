@@ -36,19 +36,26 @@ def main():
     # mesh definition
     n_cells = 5
 
-    mesh = (np.cos(np.linspace(np.pi, 0, n_cells+1)) + 1 )/2
-    # mesh = np.linspace(0, 1, n_cells+1)
+    mesh_points = (np.cos(np.linspace(np.pi, 0, n_cells+1)) + 1 )/2
 
     # values at mesh-points
-    def c(x):
-        return 0.5 - x*(0.5-0.1)
-    # conductivity = c(mesh)
-    conductivity = np.ones(n_cells+1) * 1
+    def cond(x):
+        left = 0.5
+        right = 0.5
+        return left - x*(left-right)
+    conductivity = cond(mesh_points)
 
-    def r(x):
-        return 0.5 - x*(0.5-0.1)
-    # radius = r(mesh)
-    radius = np.ones(n_cells+1) * 1
+    def rad(x):
+        left = 0.5
+        right = 0.1
+        return left - x*(left-right)
+    radius = rad(mesh_points)
+
+    def rho(x):
+        left = 0.5
+        right = 0.1
+        return left - x*(left-right)
+    rho = rho(mesh_points)
 
     # Boundary definition
     BCs = [
@@ -59,42 +66,48 @@ def main():
     ]
 
     # Numerical method
-    # solver = 'numpy.linalg.solve'
-    # solver = 'jacobi'
-    # solver = 'gauss-seidel'
-    solver = 'thomas'
     max_n = 1e4
-    rel_conv_tolerance = 1e-12
-
+    conv_tol = 1e-12
 
 
     # -------------------------------------------------
     # Solving
     # -------------------------------------------------
 
-    # add halo cells
-    mesh_h = add_halo_mesh(mesh)
-    conductivity_h = add_halo(conductivity)
-    radius_h = add_halo(radius)
-
-    area_h = radius_h**2 * np.pi
-
-    x_cell_h = np.diff(mesh_h)/2 + mesh_h[:-1]
-    dx_h = np.diff(x_cell_h)
-
-
-    # Assemble matrices and vectors
-    A = assemble_A(n_cells, conductivity_h, area_h, dx_h)
-    B = np.zeros(n_cells)
-    T_h = np.zeros(n_cells+2)
-
-
-    # actually solve system
-    T_h, R_norm_hist = solve(
-        BCs, A, B, T_h,
-        mesh_h, dx_h, conductivity_h, area_h,
-        solver, max_n, rel_conv_tolerance
+    # init mesh
+    mesh = Mesh(
+        mesh_points,
+        radius,
+        conductivity,
+        rho
     )
+
+    # init BCs
+    boundary_conditions = BoundaryConditions(
+        BCs[0][0], BCs[0][1],
+        BCs[1][0], BCs[1][1],
+    )
+
+    # init system
+    system = System(
+        mesh,
+        boundary_conditions,
+    )
+
+    system.assemble_A()
+    system.assemble_B()
+
+
+    # setup solver and solve
+    solvers = [
+        # SolverNumpy(copy.deepcopy(system), max_n, conv_tol),
+        SolverJacobi(copy.deepcopy(system), max_n, conv_tol),
+        SolverGaussSeidel(copy.deepcopy(system), max_n, conv_tol),
+        SolverThomas(copy.deepcopy(system), max_n, conv_tol),
+    ]
+
+    for solver in solvers:
+        solver.solve()
 
 
     # -------------------------------------------------
@@ -104,328 +117,413 @@ def main():
     # plot result
     fig, axs = plt.subplots(3, 1)
 
-    plot_problem(axs[0], mesh_h, conductivity_h, radius_h, BCs)
+    system.plot_system(axs[0])
     # if possilbe, plot analytic solution
-    if BCs[0][0] == 'dirichlet' and \
-       BCs[1][0] == 'dirichlet' and \
+    if boundary_conditions.left.bc_type == 'dirichlet' and \
+       boundary_conditions.right.bc_type == 'dirichlet' and \
        np.all(conductivity == conductivity[0]) and \
        np.all(radius == radius[0]):
-        plot_analytic(axs[1], BCs, mesh_h)
+        plot_analytic(axs[1], BCs, mesh.mesh_points)
 
-    plot_temp(axs[1], T_h, x_cell_h, mesh_h)
-    plot_res(axs[2], R_norm_hist)
 
+    # Residual + Solution
+    for solver in solvers:
+        solver.mesh.plot_T(axs[1], label=solver.name)
+        solver.plot_R_hists(axs[2])
     axs[1].legend()
+    mesh.plot_mesh(axs[1])
+    axs[2].legend()
 
-    fig.suptitle(f'Solver: {solver}')
+    # clean up figure
     fig.set_figwidth(10)
     fig.set_figheight(10)
     plt.tight_layout()
     plt.show()
 
 
-def solve(
-        BCs, A, B, T_h,
-        mesh_h, dx_h, conductivity_h, area_h,
-        solver, max_n, rel_conv_tolerance
-):
-    # calc initial norm (we need to set BCs for this)
-    T_h = set_T_halo(BCs, T_h, dx_h)
-    B_BCs = apply_BCs(B, T_h, conductivity_h, area_h, dx_h)
-    R_initial = calc_res(A, B_BCs, T_h[1:-1], mesh_h[1:-1])
-    R_norm_initial = calc_res_norm(R_initial)
 
-    # solve for T
-    rel_conv = 1
-    n = 0
-    R_norm_hist = [R_norm_initial]
-    while True:
 
-        # solve (ignore halo cells)
-        if solver == 'jacobi':
-            T_h[1:-1] = jacobi_step(A, B_BCs, T_h[1:-1])
-        elif solver == 'gauss-seidel':
-            T_h[1:-1] = gauss_seidel_step(A, B_BCs, T_h[1:-1])
-        elif solver == 'thomas':
-            T_h[1:-1] = thomas_step(A, B_BCs, T_h[1:-1])
+class Mesh:
+    def __init__(self, mesh_points, radius, conductivity, rho):
+        # add halos cells and save
+        self.mesh_points = self.add_halo_points(mesh_points)
+        self.x_cell_center = np.diff(self.mesh_points)/2 + self.mesh_points[:-1]
+        self.dx = np.diff(self.x_cell_center)
 
+        # geometric variables
+        self.width = self.mesh_points[1:] - self.mesh_points[:-1]
+        self.radius = self.add_halo(radius)
+        self.area = self.radius**2 * np.pi
+        # self.volume = self.area * self.dx
 
-        elif solver == 'numpy.linalg.solve':
-            T_h[1:-1] = np.linalg.solve(A, B_BCs)
+        self.conductivity = self.add_halo(conductivity)
+        self.rho = self.add_halo(rho)
 
-        # update boundary conditions
-        T_h = set_T_halo(BCs, T_h, dx_h)
-        B_BCs = apply_BCs(B, T_h, conductivity_h, area_h, dx_h)
+        self.n = len(self.rho) - 1
+        self.n_non_halo = self.n - 2
 
-        # Residuals and relative convergence
-        R = calc_res(A, B_BCs, T_h[1:-1], mesh_h[1:-1])
-        R_norm = calc_res_norm(R)
-        rel_conv = R_norm / R_norm_initial
-        R_norm_hist.append(R_norm)
+        #index of non-halo cells
+        self.ind = np.arange(self.n)[1:-1]
+        self.ind_mesh = np.arange(self.n+1)[1:-1]
 
-        n += 1
+        # init Solution vector
+        self.T = np.zeros(self.n)
 
-        # cancel loop
-        if n > max_n:
-            print('Iteration limit reached.')
-            break
+    def plot_mesh(self, ax):
+        # plot mesh
+        mi, ma = ax.get_ylim()
+        y = np.linspace(mi, ma, 2, endpoint=True)
+        for n in self.ind_mesh:
+            x = np.ones(2) * self.mesh_points[n]
+            ax.plot(x, y, '--', color='lightgray', zorder=0)
 
-        if rel_conv < rel_conv_tolerance:
-            print(f'Converged after {n} iterations.')
-            break
+    def plot_T(self, ax, label=None):
+        # plot temp
+        p = ax.plot(
+            self.x_cell_center[self.ind], self.T[self.ind],
+            '.-', label=label,
+        )
+        color = p[-1].get_color()
 
-        if rel_conv > 1e10:
-            print('Numerical method diverged.')
-            break
+        # plot value at left boundary
+        x = np.array([self.mesh_points[1], self.x_cell_center[1] ])
+        y = np.array([(self.T[0] + self.T[1]) / 2, self.T[1]])
+        ax.plot(x, y, '.--', color=color)
 
+        # plot value at right boundary
+        x = np.array([self.x_cell_center[-2], self.mesh_points[-2]])
+        y = np.array([self.T[-2], (self.T[-1] + self.T[-2]) / 2])
+        ax.plot(x, y, '.--', color=color)
 
-    return T_h, R_norm_hist
+        ax.set_title('Temp distribution')
+        ax.set_xlabel('x-position [m]')
+        ax.set_ylabel('Temperature [°K]')
 
-def jacobi_step(A, B, T):
-    T_new = np.zeros_like(T)
 
-    for i in range(len(A)):
-        sum_AT = 0
-        for j in range(len(A)):
-            if j == i:
-                continue
-            sum_AT += A[i, j]*T[j]
+    @staticmethod
+    def add_halo_points(mesh):
+        """
+        Adds a halo cell at the beginning and end by mirroring the first and last
+        cell.
 
-        T_new[i] = 1/A[i,i] * (B[i] - sum_AT)
+        This function is intended for meshes
+        """
 
-    return T_new
+        mesh_h = np.zeros(len(mesh)+2)
+        mesh_h[1:-1] = mesh
+        mesh_h[0] = mesh[0] - (mesh[1] - mesh[0])
+        mesh_h[-1] = mesh[-1] + mesh[-1] - mesh[-2]
 
-def gauss_seidel_step(A, B, T):
+        return mesh_h
 
-    for i in range(len(A)):
-        sum_AT = 0
-        for j in range(len(A)):
-            if j == i:
-                continue
-            sum_AT += A[i, j]*T[j]
+    @staticmethod
+    def add_halo(vec):
+        """
+        Adds a halo cell at the beginning and end by copying the first and last
+        cell.
 
-        T[i] = 1/A[i,i] * (B[i] - sum_AT)
+        This function is intended for scalar values
+        """
 
-    return T
+        vec_h = np.zeros(len(vec)+2)
+        vec_h[1:-1] = vec
+        vec_h[0] = vec[0]
+        vec_h[-1] = vec[-1]
 
-def thomas_step(A, B, T):
+        return  vec_h
 
-    # copy matrices
-    AA = copy.copy(A)
-    BB = copy.copy(B)
 
-    # forward elimination phase
-    for k in range(1, len(T)):
-        # ak = k, k-1
-        # bk-1 = k-1, k-1
-        # ck-1 = k-1, k
 
-        m = AA[k, k-1]/AA[k-1, k-1]
+class BoundaryCondition:
+    def __init__(self, bc_type, value):
+        self.bc_type = bc_type
+        self.value = value
 
-        AA[k, k] -= m*AA[k-1, k]
-        BB[k] -= m*BB[k-1]
+class BoundaryConditions:
+    def __init__(self, left_type, left_value, right_type, right_value):
+        self.left = BoundaryCondition(left_type, left_value)
+        self.right = BoundaryCondition(right_type, right_value)
 
-    # backwards substitution
-    T[-1] = BB[-1] / AA[-1, -1]
 
-    for k in range(len(T)-2, -1, -1):
-        # ck = k, k+1
 
-        T[k] = (BB[k] - AA[k, k+1]*T[k+1]) / AA[k, k]
+class System:
+    def __init__(self, mesh: Mesh, boundary_conditions: BoundaryConditions):
 
-    return T
+        self.mesh = mesh
+        self.BCs = boundary_conditions
 
+    def assemble_A(self):
+        self.A = np.zeros((self.mesh.n_non_halo, self.mesh.n_non_halo))
 
-def calc_res(A, B_BCs, T, mesh):
+        for i in self.mesh.ind:
+            # prepare values for neighboring cells
+            left_cell, right_cell = 0, 0
 
-    # calc residuals
-    R = np.dot(A, T) - B_BCs
+            left_cell   = self.mesh.conductivity[i] * self.mesh.area[i] / self.mesh.dx[i-1]
+            right_cell  = self.mesh.conductivity[i+1] * self.mesh.area[i+1] / self.mesh.dx[i]
 
-    # scale by element width
-    width = mesh[1:] - mesh[:-1]
-    R_scaled = np.divide(R, width)
+            # assemble equation for current cell
+            if i-1 > 0:
+                self.A[i-1, i-2]   += left_cell
+            self.A[i-1, i-1]         -= left_cell + right_cell
+            if i-1 < self.mesh.n_non_halo-1:
+                self.A[i-1, i]   += right_cell
 
-    return R_scaled
+    def assemble_B(self):
+        self.B = np.zeros(self.mesh.n_non_halo)
 
-def calc_res_norm(R_scaled):
-    R_norm = np.linalg.norm(R_scaled)
 
-    return R_norm
-
-def assemble_A(n_cells, conductivity_h, area_h, dx_h):
-    A = np.zeros((n_cells, n_cells))
-    for i in range(n_cells):
-        i_h = i + 1
-
-        # prepare values for neighboring cells
-        left_cell, right_cell = 0, 0
-
-        left_cell   = conductivity_h[i_h] * area_h[i_h] / dx_h[i]
-        right_cell  = conductivity_h[i_h+1] * area_h[i_h+1] / dx_h[i+1]
-
-        # assemble equation for current cell
-        if i > 0:
-            A[i, i-1]   += left_cell
-        A[i, i]         -= left_cell + right_cell
-        if i < n_cells-1:
-            A[i, i+1]   += right_cell
-
-    return A
-
-def set_T_halo(BCs, T_h, dx_h):
-
-    left, right = 0, 1
-    name, value = 0, 1
-
-    # calc temp in halo cells
-    # left side
-    if BCs[left][name] == 'dirichlet':
-        dT_dx = (T_h[2] - T_h[1]) / dx_h[1]
-
-        # set temp in halo cells
-        T_h[0] = BCs[left][value] - dT_dx * dx_h[0]/2
-
-    elif BCs[left][name] == 'neumann':
-        T_h[0] = -2*BCs[left][value] + T_h[1]
-
-
-    # right side
-    if BCs[right][name] == 'dirichlet':
-        dT_dx = (T_h[-2] - T_h[-3]) / dx_h[-2]
-
-        # set temp in halo cells
-        T_h[-1]= BCs[right][value] + dT_dx * dx_h[-1]/2
-
-    elif BCs[right][name] == 'neumann':
-        T_h[-1] = +2*BCs[right][value] + T_h[-2]
-
-    return T_h
-
-def apply_BCs(B, T_h, conductivity_h, area_h, dx_h):
-    B_BCs = copy.copy(B)
-    B_BCs[0] = - conductivity_h[1] * area_h[1] / dx_h[0] * T_h[0]
-    B_BCs[-1] = - conductivity_h[-2] * area_h[-2] / dx_h[-1] * T_h[-1]
-
-    return B_BCs
-
-
-def add_halo_mesh(mesh):
-    """
-    Adds a halo cell at the beginning and end by mirroring the first and last
-    cell.
-
-    This function is intended for meshes
-    """
-
-    mesh_h = np.zeros(len(mesh)+2)
-    mesh_h[1:-1] = mesh
-    mesh_h[0] = mesh[0] - (mesh[1] - mesh[0])
-    mesh_h[-1] = mesh[-1] + mesh[-1] - mesh[-2]
-
-    return mesh_h
-
-def add_halo(vec):
-    """
-    Adds a halo cell at the beginning and end by copying the first and last
-    cell.
-
-    This function is intended for scalar values
-    """
-
-    vec_h = np.zeros(len(vec)+2)
-    vec_h[1:-1] = vec
-    vec_h[0] = vec[0]
-    vec_h[-1] = vec[-1]
-
-    return  vec_h
-
-
-def plot_problem(ax, mesh_h, conductivity_h, radius_h, BCs):
-
-
-    # plot rod sizes
-    p = ax.plot(mesh_h[1:-1], radius_h[1:-1]/2, 'k')
-    ax.plot(mesh_h[1:-1], -radius_h[1:-1]/2, color=p[0].get_color())
-
-    # plot conductivity
-    ax_2 = ax.twinx()
-    ax_2.plot(mesh_h[1:-1], conductivity_h[1:-1])
-
-    # plot Boundarc conditions
-    left, right = 0, 1
-    name, value = 0, 1
-
-    for i in [left, right]:
-        text = ''
-        if BCs[i][name] == 'dirichlet':
-            text = f'$T = {BCs[i][value]} °K$'
-        elif BCs[i][name] == 'neumann':
-            text = '$\\frac{dT}{dx} = ' + str(BCs[i][value]) + \
-                   '°K/m$'
-
+    def set_BC_values(self):
+        # calc temp in halo cells
         # left side
-        x = 0 - 0.01
-        va = 'bottom'
+        if self.BCs.left.bc_type == 'dirichlet':
+            dT_dx = (self.mesh.T[2] - self.mesh.T[1]) / self.mesh.dx[1]
+
+            # set temp in halo cells
+            self.mesh.T[0] = self.BCs.left.value - dT_dx * self.mesh.dx[0]/2
+
+        elif self.BCs.left.bc_type == 'neumann':
+            self.mesh.T[0] = -2*self.BCs.left.value + self.mesh.T[1]
+
 
         # right side
-        if i == right:
-            x = mesh_h[-2] + 0.01
-            va = 'top'
+        if self.BCs.right.bc_type == 'dirichlet':
+            dT_dx = (self.mesh.T[-2] - self.mesh.T[-3]) / self.mesh.dx[-2]
 
-        # plot text
-        ax.text(
-            x, 0, text, rotation=90,
-            rotation_mode='anchor',
-            horizontalalignment='center',
-            verticalalignment=va
+            # set temp in halo cells
+            self.mesh.T[-1]= self.BCs.right.value + dT_dx * self.mesh.dx[-1]/2
+
+        elif self.BCs.right.bc_type == 'neumann':
+            self.mesh.T[-1] = +2*self.BCs.right.value + self.mesh.T[-2]
+
+    def apply_BCs(self):
+        self.B[0] = - self.mesh.conductivity[1] * self.mesh.area[1] / \
+                    self.mesh.dx[0] * self.mesh.T[0]
+        self.B[-1] = - self.mesh.conductivity[-2] * self.mesh.area[-2] / \
+                    self.mesh.dx[-1] * self.mesh.T[-1]
+
+
+    def calc_res(self):
+
+        # calc residuals
+        self.R = np.dot(self.A, self.mesh.T[1:-1]) - self.B
+
+        # scale by element width
+        self.R = np.divide(self.R, self.mesh.width[1:-1])
+
+    def calc_res_norm(self):
+        R_norm = np.linalg.norm(self.R)
+
+        return R_norm
+
+
+    def plot_system(self, ax):
+
+
+        # plot rod sizes
+        p = ax.plot(
+            self.mesh.mesh_points[self.mesh.ind_mesh],
+            self.mesh.radius[self.mesh.ind_mesh]/2,
+            'k'
+        )
+        ax.plot(
+            self.mesh.mesh_points[self.mesh.ind_mesh],
+            -self.mesh.radius[self.mesh.ind_mesh]/2,
+            color=p[0].get_color()
         )
 
+        # plot conductivity
+        ax_2 = ax.twinx()
+        ax_2.plot(
+            self.mesh.mesh_points[self.mesh.ind_mesh],
+            self.mesh.conductivity[self.mesh.ind_mesh]
+        )
 
-    # plot mesh
-    plot_mesh_lines(ax, mesh_h)
+        # # plot Boundarc conditions
 
-    ax.set_title('Problem and Mesh definition')
-    ax.set_xlabel('x-position [m]')
-    ax.set_ylabel('y-position [m]')
-    ax_2.set_ylabel('conductivity')
+        for i in range(2):
+            # left side
+            BC = self.BCs.left
 
-def plot_temp(ax, T_h, x_cell_h, mesh_h):
-    # plot temp
-    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    p = ax.plot(x_cell_h[1:-1], T_h[1:-1], '.-', color=colors[0], label='Numeric')
-    color = p[-1].get_color()
+            # right side
+            if i == 1:
+                BC = self.BCs.right
 
-    # plot value at left boundary
-    x = np.array([mesh_h[1], x_cell_h[1] ])
-    y = np.array([(T_h[0] + T_h[1]) / 2, T_h[1]])
-    ax.plot(x, y, '.--', color=color)
+            text = ''
+            if BC.bc_type == 'dirichlet':
+                text = f'$T = {BC.value} °K$'
+            elif BC.bc_type == 'neumann':
+                text = '$\\frac{dT}{dx} = ' + str(BC.value) + \
+                    '°K/m$'
 
-    # plot value at right boundary
-    x = np.array([x_cell_h[-2], mesh_h[-2]])
-    y = np.array([T_h[-2], (T_h[-1] + T_h[-2]) / 2])
-    ax.plot(x, y, '.--', color=color)
+            # left side
+            x = 0 - 0.01
+            va = 'bottom'
 
-    plot_mesh_lines(ax, mesh_h)
+            # right side
+            if i == 1:
+                x = self.mesh.mesh_points[self.mesh.ind_mesh][-1] + 0.01
+                va = 'top'
 
-    ax.set_title('Temp distribution')
-    ax.set_xlabel('x-position [m]')
-    ax.set_ylabel('Temperature [°K]')
+            # plot text
+            ax.text(
+                x, 0, text, rotation=90,
+                rotation_mode='anchor',
+                horizontalalignment='center',
+                verticalalignment=va
+            )
 
-def plot_res(ax, R_norm_hist):
-    ax.plot(R_norm_hist)
-    ax.set_yscale('log')
+        # plot mesh
+        self.mesh.plot_mesh(ax)
 
-    ax.set_title('Residual')
-    ax.set_xlabel('Iteration')
-    ax.set_ylabel('RMS L2 norm')
+        ax.set_title('Problem and Mesh definition')
+        ax.set_xlabel('x-position [m]')
+        ax.set_ylabel('y-position [m]')
+        ax_2.set_ylabel('conductivity')
 
-def plot_mesh_lines(ax, mesh_h):
-    # plot mesh
-    mi, ma = ax.get_ylim()
-    y = np.linspace(mi, ma, 2, endpoint=True)
-    for n in range(1, len(mesh_h)-1):
-        x = np.ones(2) * mesh_h[n]
-        ax.plot(x, y, '--', color='lightgray')
+
+
+class Solver:
+    name = 'Solver'
+    def __init__(self, system: System, max_n=100, conv_tol=1e-4):
+
+        self.system = system
+        self.mesh = system.mesh
+
+        self.R_ref_norm = None
+        self.R_norm_hist = list()
+
+        self.max_n = max_n
+        self.conv_tol = conv_tol
+
+    def solve(self):
+
+        # apply boundary conditions
+        self.system.set_BC_values()
+        self.system.apply_BCs()
+
+        # calculate initial residuals
+        self.system.calc_res()
+        self.R_ref_norm = self.system.calc_res_norm()
+
+        # solve for T
+        rel_conv = 1
+        n = 0
+        self.R_norm_hist.append(self.R_ref_norm)
+        while True:
+
+            # actually solve
+            self.solve_step()
+
+            # update boundary conditions
+            self.system.set_BC_values()
+            self.system.apply_BCs()
+
+            # Residuals and relative convergence
+            self.system.calc_res()
+            R_norm = self.system.calc_res_norm()
+            rel_conv = R_norm / self.R_ref_norm
+            self.R_norm_hist.append(R_norm)
+
+            n += 1
+
+            # cancel loop
+            if n > self.max_n:
+                print(f'{self.name}: Iteration limit reached.')
+                break
+
+            if rel_conv < self.conv_tol:
+                print(f'{self.name}: Converged after {n} iterations.')
+                break
+
+            if rel_conv > 1e10:
+                print(f'{self.name}: Numerical method diverged.')
+                break
+
+    def solve_step(self):
+        raise NotImplementedError
+
+    def plot_R_hists(self, ax):
+        ax.plot(self.R_norm_hist, label=self.name)
+        ax.set_yscale('log')
+
+        ax.set_title('Residual')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('RMS Heat Flux')
+
+
+class SolverNumpy(Solver):
+    name = 'numpy.linalg.solve'
+    def solve_step(self):
+        self.mesh.T[self.mesh.ind] = np.linalg.solve(
+            self.system.A, self.system.B
+        )
+
+class SolverJacobi(Solver):
+    name = 'Jacobi'
+    def solve_step(self):
+        T_new = np.zeros_like(self.mesh.T[self.mesh.ind])
+
+        for i in range(self.mesh.n_non_halo):
+            sum_AT = 0
+            for j in range(self.mesh.n_non_halo):
+                if j == i:
+                    continue
+                sum_AT += self.system.A[i, j]*self.mesh.T[self.mesh.ind][j]
+
+            T_new[i] = 1/self.system.A[i,i] * (self.system.B[i] - sum_AT)
+
+        self.mesh.T[self.mesh.ind] = T_new
+
+class SolverGaussSeidel(Solver):
+    name = 'Gauss-Seidel'
+    def solve_step(self):
+
+        T = self.mesh.T[self.mesh.ind]
+
+        for i in range(self.mesh.n_non_halo):
+            sum_AT = 0
+            for j in range(self.mesh.n_non_halo):
+                if j == i:
+                    continue
+                sum_AT += self.system.A[i, j]*T[j]
+
+            T[i] = 1/self.system.A[i,i] * \
+                (self.system.B[i] - sum_AT)
+
+        self.mesh.T[self.mesh.ind] = T
+
+class SolverThomas(Solver):
+    name = 'Thomas'
+    def solve_step(self):
+
+        # copy matrices
+        AA = copy.copy(self.system.A)
+        BB = copy.copy(self.system.B)
+        T = self.mesh.T[self.mesh.ind]
+
+        # forward elimination phase
+        for k in range(1, self.mesh.n_non_halo):
+            # ak = k, k-1
+            # bk-1 = k-1, k-1
+            # ck-1 = k-1, k
+
+            m = AA[k, k-1]/AA[k-1, k-1]
+
+            AA[k, k] -= m*AA[k-1, k]
+            BB[k] -= m*BB[k-1]
+
+        # backwards substitution
+        T[-1] = BB[-1] / AA[-1, -1]
+
+        for k in range(self.mesh.n_non_halo-2, -1, -1):
+            # ck = k, k+1
+
+            T[k] = (BB[k] - AA[k, k+1] * T[k+1]) / AA[k, k]
+
+        self.mesh.T[self.mesh.ind] = T
+
+
 
 def plot_analytic(ax, BCs, mesh_h):
 
