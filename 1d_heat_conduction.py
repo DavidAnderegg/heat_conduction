@@ -174,7 +174,7 @@ class Mesh:
         self.p_ind = np.arange(self.c_n+1)[1:-1]
 
         # init Solution vector
-        self.T = np.zeros(self.c_n)
+        self.c_T = np.zeros(self.c_n)
 
     def plot_mesh(self, ax):
         # plot mesh
@@ -187,19 +187,19 @@ class Mesh:
     def plot_T(self, ax, label=None):
         # plot temp
         p = ax.plot(
-            self.c_x[self.c_ind], self.T[self.c_ind],
+            self.c_x[self.c_ind], self.c_T[self.c_ind],
             '.-', label=label,
         )
         color = p[-1].get_color()
 
         # plot value at left boundary
         x = np.array([self.p_x[1], self.c_x[1] ])
-        y = np.array([(self.T[0] + self.T[1]) / 2, self.T[1]])
+        y = np.array([(self.c_T[0] + self.c_T[1]) / 2, self.c_T[1]])
         ax.plot(x, y, '.--', color=color)
 
         # plot value at right boundary
         x = np.array([self.c_x[-2], self.p_x[-2]])
-        y = np.array([self.T[-2], (self.T[-1] + self.T[-2]) / 2])
+        y = np.array([self.c_T[-2], (self.c_T[-1] + self.c_T[-2]) / 2])
         ax.plot(x, y, '.--', color=color)
 
         ax.set_title('Temp distribution')
@@ -287,36 +287,36 @@ class System:
         # calc temp in halo cells
         # left side
         if self.BCs.left.bc_type == 'dirichlet':
-            dT_c_dx = (self.mesh.T[2] - self.mesh.T[1]) / self.mesh.c_dx[1]
+            dT_c_dx = (self.mesh.c_T[2] - self.mesh.c_T[1]) / self.mesh.c_dx[1]
 
             # set temp in halo cells
-            self.mesh.T[0] = self.BCs.left.value - dT_c_dx * self.mesh.c_dx[0]/2
+            self.mesh.c_T[0] = self.BCs.left.value - dT_c_dx * self.mesh.c_dx[0]/2
 
         elif self.BCs.left.bc_type == 'neumann':
-            self.mesh.T[0] = -2*self.BCs.left.value + self.mesh.T[1]
+            self.mesh.c_T[0] = -2*self.BCs.left.value + self.mesh.c_T[1]
 
 
         # right side
         if self.BCs.right.bc_type == 'dirichlet':
-            dT_c_dx = (self.mesh.T[-2] - self.mesh.T[-3]) / self.mesh.c_dx[-2]
+            dT_c_dx = (self.mesh.c_T[-2] - self.mesh.c_T[-3]) / self.mesh.c_dx[-2]
 
             # set temp in halo cells
-            self.mesh.T[-1]= self.BCs.right.value + dT_c_dx * self.mesh.c_dx[-1]/2
+            self.mesh.c_T[-1]= self.BCs.right.value + dT_c_dx * self.mesh.c_dx[-1]/2
 
         elif self.BCs.right.bc_type == 'neumann':
-            self.mesh.T[-1] = +2*self.BCs.right.value + self.mesh.T[-2]
+            self.mesh.c_T[-1] = +2*self.BCs.right.value + self.mesh.c_T[-2]
 
     def apply_BCs(self):
         self.B[0] = - self.mesh.p_conductivity[1] * self.mesh.p_area[1] / \
-                    self.mesh.c_dx[0] * self.mesh.T[0]
+                    self.mesh.c_dx[0] * self.mesh.c_T[0]
         self.B[-1] = - self.mesh.p_conductivity[-2] * self.mesh.p_area[-2] / \
-                    self.mesh.c_dx[-1] * self.mesh.T[-1]
+                    self.mesh.c_dx[-1] * self.mesh.c_T[-1]
 
 
     def calc_res(self):
 
         # calc residuals
-        self.R = np.dot(self.A, self.mesh.T[1:-1]) - self.B
+        self.R = np.dot(self.A, self.mesh.c_T[1:-1]) - self.B
 
         # scale by element width
         self.R = np.divide(self.R, self.mesh.c_width[1:-1])
@@ -465,31 +465,31 @@ class Solver:
 class SolverNumpy(Solver):
     name = 'numpy.linalg.solve'
     def solve_step(self):
-        self.mesh.T[self.mesh.c_ind] = np.linalg.solve(
+        self.mesh.c_T[self.mesh.c_ind] = np.linalg.solve(
             self.system.A, self.system.B
         )
 
 class SolverJacobi(Solver):
     name = 'Jacobi'
     def solve_step(self):
-        T_new = np.zeros_like(self.mesh.T[self.mesh.c_ind])
+        T_new = np.zeros_like(self.mesh.c_T[self.mesh.c_ind])
 
         for i in range(self.mesh.c_n_non_halo):
             sum_AT = 0
             for j in range(self.mesh.c_n_non_halo):
                 if j == i:
                     continue
-                sum_AT += self.system.A[i, j]*self.mesh.T[self.mesh.c_ind][j]
+                sum_AT += self.system.A[i, j]*self.mesh.c_T[self.mesh.c_ind][j]
 
             T_new[i] = 1/self.system.A[i,i] * (self.system.B[i] - sum_AT)
 
-        self.mesh.T[self.mesh.c_ind] = T_new
+        self.mesh.c_T[self.mesh.c_ind] = T_new
 
 class SolverGaussSeidel(Solver):
     name = 'Gauss-Seidel'
     def solve_step(self):
 
-        T = self.mesh.T[self.mesh.c_ind]
+        T = self.mesh.c_T[self.mesh.c_ind]
 
         for i in range(self.mesh.c_n_non_halo):
             sum_AT = 0
@@ -501,7 +501,7 @@ class SolverGaussSeidel(Solver):
             T[i] = 1/self.system.A[i,i] * \
                 (self.system.B[i] - sum_AT)
 
-        self.mesh.T[self.mesh.c_ind] = T
+        self.mesh.c_T[self.mesh.c_ind] = T
 
 class SolverThomas(Solver):
     name = 'Thomas'
@@ -510,7 +510,7 @@ class SolverThomas(Solver):
         # copy matrices
         AA = copy.copy(self.system.A)
         BB = copy.copy(self.system.B)
-        T = self.mesh.T[self.mesh.c_ind]
+        T = self.mesh.c_T[self.mesh.c_ind]
 
         # forward elimination phase
         for k in range(1, self.mesh.c_n_non_halo):
@@ -531,7 +531,7 @@ class SolverThomas(Solver):
 
             T[k] = (BB[k] - AA[k, k+1] * T[k+1]) / AA[k, k]
 
-        self.mesh.T[self.mesh.c_ind] = T
+        self.mesh.c_T[self.mesh.c_ind] = T
 
 
 
