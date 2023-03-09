@@ -1,3 +1,4 @@
+from operator import itemgetter
 import numpy as np
 import copy
 import matplotlib.pyplot as plt
@@ -26,34 +27,37 @@ def main():
     # A0        A1         A2         A3         A4         A5
     #     T0    |    T1    |    T2    |    T3    |    T4    |
 
-    # i_h = 2
-
 
     # -------------------------------------------------
     # Problem definition
     # -------------------------------------------------
 
     # mesh definition
-    n_cells = 5
-
-    mesh_points = (np.cos(np.linspace(np.pi, 0, n_cells+1)) + 1 )/2
+    n_cells = 10
+    mesh_points = ((np.cos(np.linspace(np.pi, 0, n_cells+1)) + 1 )/2 )
 
     # values at mesh-points
-    def cond(x):
-        left = 0.5
-        right = 0.5
-        return left - x*(left-right)
-    conductivity = cond(mesh_points)
-
     def rad(x):
-        left = 0.5
-        right = 0.1
+        left = 1
+        right = 1
         return left - x*(left-right)
     radius = rad(mesh_points)
 
+    def cond(x):
+        left = 1
+        right = 1
+        return left - x*(left-right)
+    conductivity = cond(mesh_points)
+
+    def cap(x):
+        left = 1
+        right = 1
+        return left - x*(left-right)
+    capacity = cap(mesh_points)
+
     def rho(x):
-        left = 0.5
-        right = 0.1
+        left = 1
+        right = 1
         return left - x*(left-right)
     rho = rho(mesh_points)
 
@@ -61,13 +65,16 @@ def main():
     BCs = [
         ['dirichlet', 100],
         # ['neumann', 0.01],
-        ['dirichlet', 50],
+        ['dirichlet', 20],
         # ['neumann', 0.1],
     ]
 
     # Numerical method
     max_n = 1e4
     conv_tol = 1e-12
+
+    # problem = 'steady'
+    problem = 'pseudo-transient'
 
 
     # -------------------------------------------------
@@ -79,6 +86,7 @@ def main():
         mesh_points,
         radius,
         conductivity,
+        capacity,
         rho
     )
 
@@ -92,6 +100,7 @@ def main():
     system = System(
         mesh,
         boundary_conditions,
+        problem=problem,
     )
 
     system.assemble_A()
@@ -118,13 +127,13 @@ def main():
     fig, axs = plt.subplots(3, 1)
 
     system.plot_system(axs[0])
+
     # if possible, plot analytic solution
     if boundary_conditions.left.bc_type == 'dirichlet' and \
        boundary_conditions.right.bc_type == 'dirichlet' and \
        np.all(conductivity == conductivity[0]) and \
        np.all(radius == radius[0]):
         plot_analytic(axs[1], BCs, mesh.p_x)
-
 
     # Residual + Solution
     for solver in solvers:
@@ -144,30 +153,43 @@ def main():
 
 
 class Mesh:
-    def __init__(self, p_x, p_radius, p_conductivity, p_rho):
+    def __init__(self, p_x, p_radius, p_conductivity, p_capacity, p_rho):
         # prefix p means a value at a grid point
         # prefix c means a value at the cell center
 
-        # add halos cells and save
+        #  point quantities
         self.p_x = self.add_halo_points(p_x)
+
+        self.p_radius = self.add_halo(p_radius)
+        self.p_area = self.p_radius**2 * np.pi
+
+        self.p_conductivity = self.add_halo(p_conductivity)
+
+        self.p_n = len(self.p_x)
+        self.p_n_non_halo = self.p_n -2
+
+
+        # cell quantities
+        self.c_n = self.p_n - 1
+        self.c_n_non_halo = self.c_n - 2
 
         self.c_x = np.diff(self.p_x)/2 + self.p_x[:-1]
         self.c_dx = np.diff(self.c_x)
         self.c_width = self.p_x[1:] - self.p_x[:-1]
 
-        # geometric variables
-        self.p_radius = self.add_halo(p_radius)
-        self.p_area = self.p_radius**2 * np.pi
-        # self.volume = self.p_area * self.c_dx
+        c_area = self.interp_p2c(self.p_area)
+        self.c_volume = c_area * self.c_width
+        self.c_rho = self.interp_p2c(self.add_halo(p_rho))
+        self.c_capacity = self.interp_p2c(self.add_halo(p_capacity))
+        self.c_conductivity = self.interp_p2c(self.add_halo(p_conductivity))
 
-        self.p_conductivity = self.add_halo(p_conductivity)
-        self.p_rho = self.add_halo(p_rho)
 
-        self.p_n = len(self.p_rho)
-        self.p_n_non_halo = self.p_n -2
+        # average quantities
+        self.total_volume = np.sum(self.c_volume)
+        self.av_rho = np.dot(self.c_rho, self.c_volume) / self.total_volume
+        self.av_capacity = np.dot(self.c_capacity, self.c_volume) / self.total_volume
+        self.av_conductivity = np.dot(self.c_conductivity, self.c_volume) / self.total_volume
 
-        self.c_n = len(self.p_rho) - 1
-        self.c_n_non_halo = self.c_n - 2
 
         #index of non-halo cells
         self.c_ind = np.arange(self.c_n)[1:-1]
@@ -195,12 +217,12 @@ class Mesh:
         # plot value at left boundary
         x = np.array([self.p_x[1], self.c_x[1] ])
         y = np.array([(self.c_T[0] + self.c_T[1]) / 2, self.c_T[1]])
-        ax.plot(x, y, '.--', color=color)
+        ax.plot(x, y, '--', color=color)
 
         # plot value at right boundary
         x = np.array([self.c_x[-2], self.p_x[-2]])
         y = np.array([self.c_T[-2], (self.c_T[-1] + self.c_T[-2]) / 2])
-        ax.plot(x, y, '.--', color=color)
+        ax.plot(x, y, '--', color=color)
 
         ax.set_title('Temp distribution')
         ax.set_xlabel('x-position [m]')
@@ -239,6 +261,11 @@ class Mesh:
 
         return  vec_h
 
+    @staticmethod
+    def interp_p2c(vec):
+        """Interpolates from a point quantity to a cell quantity"""
+        ret_vec = (vec[1:] + vec[:-1]) / 2
+        return ret_vec
 
 
 class BoundaryCondition:
@@ -254,33 +281,84 @@ class BoundaryConditions:
 
 
 class System:
-    def __init__(self, mesh: Mesh, boundary_conditions: BoundaryConditions):
+    def __init__(self, mesh: Mesh, boundary_conditions: BoundaryConditions, problem='steady'):
 
         self.mesh = mesh
         self.BCs = boundary_conditions
 
-        self.dt = 0.1
+        # steady = no transient part
+        # pseudo-transient = steady solution, but using transient part
+        # transient = only transient solution
+        self.problem = problem
+
+        self.dt = 1
+        if self.problem == 'pseudo-transient':
+            self.calc_optimal_timestep()
+
+    def calc_optimal_timestep(self):
+        L0 = np.max(self.mesh.p_x[self.mesh.p_ind]) - np.min(self.mesh.p_x[self.mesh.p_ind])
+
+        alpha = self.mesh.av_conductivity / (self.mesh.av_capacity * self.mesh.av_rho)
+        U0 = alpha / L0
+        self.dt = L0 / U0
+
+        print(f'Optimal timestep for pseudo-transient is: {self.dt}')
+
 
     def assemble_A(self):
-        self.A = np.zeros((self.mesh.c_n_non_halo, self.mesh.c_n_non_halo))
+        self.A_steady = np.zeros((self.mesh.c_n_non_halo, self.mesh.c_n_non_halo))
+
+        self.A_unsteady = np.zeros_like(self.A_steady)
 
         for i in self.mesh.c_ind:
             # prepare values for neighboring cells
             left_cell, right_cell = 0, 0
 
-            left_cell   = self.mesh.p_conductivity[i] * self.mesh.p_area[i] / self.mesh.c_dx[i-1]
-            right_cell  = self.mesh.p_conductivity[i+1] * self.mesh.p_area[i+1] / self.mesh.c_dx[i]
+            left_cell   = self.mesh.p_conductivity[i] * self.mesh.p_area[i] / \
+                self.mesh.c_dx[i-1]
+            right_cell  = self.mesh.p_conductivity[i+1] * self.mesh.p_area[i+1] / \
+                self.mesh.c_dx[i]
 
+            # unsteady part
+            self.A_unsteady[i-1, i-1] += self.mesh.c_rho[i] * \
+                self.mesh.c_capacity[i] * self.mesh.c_volume[i] / self.dt
 
             # assemble equation for current cell
             if i-1 > 0:
-                self.A[i-1, i-2]   += left_cell
-            self.A[i-1, i-1]         -= left_cell + right_cell
+                self.A_steady[i-1, i-2]   += left_cell
+            self.A_steady[i-1, i-1]         -= left_cell + right_cell
             if i-1 < self.mesh.c_n_non_halo-1:
-                self.A[i-1, i]   += right_cell
+                self.A_steady[i-1, i]   += right_cell
+
 
     def assemble_B(self):
-        self.B = np.zeros(self.mesh.c_n_non_halo)
+        # steady sources
+        self.B_steady = np.zeros(self.mesh.c_n_non_halo)
+
+        # unsteady part
+        self.B_unsteady = np.zeros_like(self.B_steady)
+
+
+    def update_B_unsteady(self):
+        self.B_unsteady = self.mesh.c_rho[self.mesh.c_ind] * \
+            self.mesh.c_capacity[self.mesh.c_ind] * \
+            self.mesh.c_volume[self.mesh.c_ind] * \
+            self.mesh.c_T[self.mesh.c_ind] / self.dt
+
+    @property
+    def A(self):
+        if self.problem == 'pseudo-transient':
+            return self.A_steady + self.A_unsteady
+        # steady
+        return self.A_steady
+
+    @property
+    def B(self):
+        if self.problem == 'pseudo-transient':
+            return self.B_steady + self.B_unsteady
+
+        #steady
+        return self.B_steady
 
 
     def set_BC_values(self):
@@ -307,16 +385,16 @@ class System:
             self.mesh.c_T[-1] = +2*self.BCs.right.value + self.mesh.c_T[-2]
 
     def apply_BCs(self):
-        self.B[0] = - self.mesh.p_conductivity[1] * self.mesh.p_area[1] / \
+        self.B_steady[0] = - self.mesh.p_conductivity[1] * self.mesh.p_area[1] / \
                     self.mesh.c_dx[0] * self.mesh.c_T[0]
-        self.B[-1] = - self.mesh.p_conductivity[-2] * self.mesh.p_area[-2] / \
+        self.B_steady[-1] = - self.mesh.p_conductivity[-2] * self.mesh.p_area[-2] / \
                     self.mesh.c_dx[-1] * self.mesh.c_T[-1]
 
 
     def calc_res(self):
 
         # calc residuals
-        self.R = np.dot(self.A, self.mesh.c_T[1:-1]) - self.B
+        self.R = np.dot(self.A_steady, self.mesh.c_T[1:-1]) - self.B_steady
 
         # scale by element width
         self.R = np.divide(self.R, self.mesh.c_width[1:-1])
@@ -328,8 +406,6 @@ class System:
 
 
     def plot_system(self, ax):
-
-
         # plot rod sizes
         p = ax.plot(
             self.mesh.p_x[self.mesh.p_ind],
@@ -367,12 +443,12 @@ class System:
                     '°K/m$'
 
             # left side
-            x = 0 - 0.01
+            x = np.min(self.mesh.p_x[self.mesh.p_ind]) - 0.01
             va = 'bottom'
 
             # right side
             if i == 1:
-                x = self.mesh.p_x[self.mesh.p_ind][-1] + 0.01
+                x = np.max(self.mesh.p_x[self.mesh.p_ind][-1]) + 0.01
                 va = 'top'
 
             # plot text
@@ -428,6 +504,10 @@ class Solver:
             # update boundary conditions
             self.system.set_BC_values()
             self.system.apply_BCs()
+
+            # update unsteady Source terms
+            if self.system.problem == 'pseudo-transient':
+                self.system.update_B_unsteady()
 
             # Residuals and relative convergence
             self.system.calc_res()
