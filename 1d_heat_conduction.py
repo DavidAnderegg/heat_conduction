@@ -1,6 +1,7 @@
 from operator import itemgetter
 import numpy as np
 import copy
+import time
 import matplotlib.pyplot as plt
 
 
@@ -33,13 +34,13 @@ def main():
     # -------------------------------------------------
 
     # mesh definition
-    n_cells = 10
+    n_cells = 1000
     mesh_points = ((np.cos(np.linspace(np.pi, 0, n_cells+1)) + 1 )/2 )
 
     # values at mesh-points
     def rad(x):
         left = 1
-        right = 1
+        right = 0.1
         return left - x*(left-right)
     radius = rad(mesh_points)
 
@@ -73,8 +74,8 @@ def main():
     max_n = 1e4
     conv_tol = 1e-12
 
-    # problem = 'steady'
-    problem = 'pseudo-transient'
+    problem = 'steady'
+    # problem = 'pseudo-transient'
 
 
     # -------------------------------------------------
@@ -110,9 +111,11 @@ def main():
     # setup solver and solve
     solvers = [
         # SolverNumpy(copy.deepcopy(system), max_n, conv_tol),
-        SolverJacobi(copy.deepcopy(system), max_n, conv_tol),
-        SolverGaussSeidel(copy.deepcopy(system), max_n, conv_tol),
-        SolverThomas(copy.deepcopy(system), max_n, conv_tol),
+        # SolverJacobi(copy.deepcopy(system), max_n, conv_tol),
+        # SolverGaussSeidel(copy.deepcopy(system), max_n, conv_tol),
+        # SolverThomas(copy.deepcopy(system), max_n, conv_tol),
+        SolverNewton(copy.deepcopy(system), max_n, conv_tol, jac_type='FD'),
+        SolverNewton(copy.deepcopy(system), max_n, conv_tol, jac_type='FD_col'),
     ]
 
     for solver in solvers:
@@ -286,6 +289,9 @@ class System:
         self.mesh = mesh
         self.BCs = boundary_conditions
 
+        # residual vector
+        self.R = np.zeros(self.mesh.c_n_non_halo)
+
         # steady = no transient part
         # pseudo-transient = steady solution, but using transient part
         # transient = only transient solution
@@ -392,17 +398,79 @@ class System:
 
 
     def calc_res(self):
+        self.R = self._calc_res(
+            self.A_steady,
+            self.mesh.c_T[self.mesh.c_ind],
+            self.B_steady
+        )
 
+    def _calc_res(self, A, T, B):
         # calc residuals
-        self.R = np.dot(self.A_steady, self.mesh.c_T[1:-1]) - self.B_steady
+        R = np.dot(A, T) - B
 
         # scale by element width
-        self.R = np.divide(self.R, self.mesh.c_width[1:-1])
+        R = np.multiply(R, self.mesh.c_width[1:-1])
+
+        return R
 
     def calc_res_norm(self):
         R_norm = np.linalg.norm(self.R)
 
         return R_norm
+
+
+    def calc_res_jac_fd(self):
+        """Calculate the Jacobian of the residuals in a finite-difference way"""
+
+        h = 1e-7
+
+        JR = np.zeros((self.mesh.c_n_non_halo, self.mesh.c_n_non_halo))
+        for i in range(self.mesh.c_n_non_halo):
+            T = self.mesh.c_T[self.mesh.c_ind]
+            T[i] += h
+
+            R_step = self._calc_res(
+                self.A_steady,
+                T,
+                self.B_steady
+            )
+
+            JR_col = (R_step - self.R) / h
+            JR[:,i] = JR_col
+
+        return JR
+
+    def calc_res_jac_fd_col(self):
+        """Calculate the Jacobian of the residuals in a finite-difference way.
+        But it uses coloring for more efficiency"""
+
+        stencil_size = 3
+        h = 1e-7
+
+        JR = np.zeros((self.mesh.c_n_non_halo, self.mesh.c_n_non_halo))
+        for i in range(stencil_size):
+            # figure out coloring indexes
+            ind_color = np.arange(i, self.mesh.c_n_non_halo, stencil_size)
+
+            # apply FD step
+            T = self.mesh.c_T[self.mesh.c_ind]
+            T[ind_color] += h
+
+            # perform f(x)
+            R_step = self._calc_res(
+                self.A_steady,
+                T,
+                self.B_steady
+            )
+            JR_col = (R_step - self.R) / h
+
+            # fill jacobian
+            for ind in ind_color:
+                i_start = max(ind - 1, 0)
+                i_end = min(ind+2, self.mesh.c_n_non_halo)
+                JR[i_start:i_end,ind] = JR_col[i_start:i_end]
+
+        return JR
 
 
     def plot_system(self, ax):
@@ -482,7 +550,12 @@ class Solver:
         self.max_n = max_n
         self.conv_tol = conv_tol
 
+        self.rel_conv = 1
+        self.n = 0
+
     def solve(self):
+
+        t0 = time.time_ns()
 
         # apply boundary conditions
         self.system.set_BC_values()
@@ -493,8 +566,6 @@ class Solver:
         self.R_ref_norm = self.system.calc_res_norm()
 
         # solve for T
-        rel_conv = 1
-        n = 0
         self.R_norm_hist.append(self.R_ref_norm)
         while True:
 
@@ -512,23 +583,26 @@ class Solver:
             # Residuals and relative convergence
             self.system.calc_res()
             R_norm = self.system.calc_res_norm()
-            rel_conv = R_norm / self.R_ref_norm
+            self.rel_conv = R_norm / self.R_ref_norm
             self.R_norm_hist.append(R_norm)
 
-            n += 1
+            self.n += 1
 
             # cancel loop
-            if n > self.max_n:
+            if self.n > self.max_n:
                 print(f'{self.name}: Iteration limit reached.')
                 break
 
-            if rel_conv < self.conv_tol:
-                print(f'{self.name}: Converged after {n} iterations.')
+            if self.rel_conv < self.conv_tol:
+                print(f'{self.name}: Converged after {self.n} iterations.')
                 break
 
-            if rel_conv > 1e10:
+            if self.rel_conv > 1e10:
                 print(f'{self.name}: Numerical method diverged.')
                 break
+
+        tt = (time.time_ns() - t0) / 1e9
+        print(f'{self.name}: Finished after {tt} seconds.')
 
     def solve_step(self):
         raise NotImplementedError
@@ -613,6 +687,26 @@ class SolverThomas(Solver):
 
         self.mesh.c_T[self.mesh.c_ind] = T
 
+class SolverNewton(Solver):
+    def __init__(self, system: System, max_n=100, conv_tol=0.0001, jac_type='FD'):
+        super().__init__(system, max_n, conv_tol)
+
+        self.jac_type = jac_type
+        self.name = f'Newton_{jac_type}'
+
+    def solve_step(self):
+
+        # JR = np.zeros((self.mesh.c_n_non_halo, self.mesh.c_n_non_halo))
+        if self.jac_type == 'FD':
+            JR = self.system.calc_res_jac_fd()
+        elif self.jac_type == 'FD_col':
+            JR = self.system.calc_res_jac_fd_col()
+
+        # JR_inv = JR
+        JR_inv = np.linalg.inv(JR)
+
+        self.mesh.c_T[self.mesh.c_ind] = self.mesh.c_T[self.mesh.c_ind] - \
+             np.dot(JR_inv, self.system.R)
 
 
 def plot_analytic(ax, BCs, mesh_h):
