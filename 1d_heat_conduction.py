@@ -47,16 +47,21 @@ def main():
     # -------------------------------------------------
 
     # mesh definition
-    n_cells = 100
+    n_cells = 10
     mesh_points = ((np.cos(np.linspace(np.pi, 0, n_cells+1)) + 1 )/2 )
-    # mesh_points = np.linspace(0, 1, n_cells)
+    # mesh_points = np.linspace(0, 1, n_cells+1)
+
+    # s = np.linspace(0, 1, n_cells)
+    # mesh_points = np.cumsum(s)
 
     # split mesh
     if comm is not None:
         n = int(n_cells/size)
-        i_start = 0 if rank == 0 else n*rank - 1
-        i_stop = n_cells if rank == size-1 else n*(rank + 1)
+        i_start = 0 if rank == 0 else n*rank - 2
+        i_stop = n_cells + 1 if rank == size-1 else n*(rank + 1) + 1
         mesh_points = mesh_points[i_start:i_stop]
+
+    print(f'Rank {rank}:', mesh_points)
 
     # values at mesh-points
     def rad(x):
@@ -85,7 +90,7 @@ def main():
 
     # Boundary definition
     BCs = [
-        ['dirichlet', 100],
+        ['dirichlet', 1000],
         # ['neumann', 0.01],
         ['dirichlet', 20],
         # ['neumann', 0.1],
@@ -93,7 +98,7 @@ def main():
 
     # Numerical method
     max_n = 1e4
-    conv_tol = 1e-12
+    conv_tol = 1e-14
 
     problem = 'steady'
     # problem = 'pseudo-transient'
@@ -249,10 +254,20 @@ class Mesh:
         This function is intended for meshes
         """
 
-        mesh_h = np.zeros(len(mesh)+2)
-        mesh_h[1:-1] = mesh
-        mesh_h[0] = mesh[0] - (mesh[1] - mesh[0])
-        mesh_h[-1] = mesh[-1] + mesh[-1] - mesh[-2]
+        # if we are not the first or last processor, no halo cells need to be added
+        if rank > 0 and rank < size-1:
+            return mesh
+
+        left, right = np.array([]), np.array([])
+
+        # add halo to left
+        if rank == 0:
+            left = np.array([mesh[0] - (mesh[1] - mesh[0])])
+
+        if rank == size - 1:
+            right = np.array([mesh[-1] + mesh[-1] - mesh[-2]])
+
+        mesh_h = np.concatenate([left, mesh, right])
 
         return mesh_h
 
@@ -265,10 +280,20 @@ class Mesh:
         This function is intended for scalar values
         """
 
-        vec_h = np.zeros(len(vec)+2)
-        vec_h[1:-1] = vec
-        vec_h[0] = vec[0]
-        vec_h[-1] = vec[-1]
+        # if we are not the first or last processor, no halo cells need to be added
+        if rank > 0 and rank < size-1:
+            return vec
+
+        left, right = np.array([]), np.array([])
+
+        # add halo to left
+        if rank == 0:
+            left = np.array([vec[0]])
+
+        if rank == size - 1:
+            right = np.array([vec[-1]])
+
+        vec_h = np.concatenate([left, vec, right])
 
         return  vec_h
 
@@ -305,6 +330,7 @@ class Solution:
         self.exchange_sizes(mesh)
 
         # gather all the data from all procs
+        print(mesh.p_x, rank)
         self.p_x = self.exchange_p_values(mesh.p_x[mesh.p_ind])
         self.p_radius = self.exchange_p_values(mesh.p_radius[mesh.p_ind])
         self.p_conductivity = self.exchange_p_values(mesh.p_conductivity[mesh.p_ind])
@@ -313,6 +339,24 @@ class Solution:
         self.c_x = self.exchange_c_values(mesh.c_x[mesh.c_ind])
         self.c_T = self.exchange_c_values(mesh.c_T[mesh.c_ind])
 
+
+        # gather T values on Halo cells from lowest and highest proc
+        # This is needed for plotting
+        self.c_T_halo = self.gather_T_halo(mesh.c_T)
+
+
+    def gather_T_halo(self, c_T):
+        if comm is None:
+            return np.array([c_T[0], c_T[-1]])
+
+
+        left = c_T[0] if rank == 0 else None
+        left = comm.bcast(left, root=0)
+
+        right = c_T[-1] if rank == size-1 else None
+        right = comm.bcast(right, root=size-1)
+
+        return np.array([left, right])
 
     def exchange_sizes(self, mesh):
         # cancel if MPI ist not available
@@ -325,7 +369,7 @@ class Solution:
         sendbuf = np.array(local_array)
         self.c_sendcounts = np.array(comm.gather(len(sendbuf), 0))
 
-        # figure out sizes of pint values
+        # figure out sizes of point values
         local_array = mesh.p_x[mesh.p_ind]
 
         sendbuf = np.array(local_array)
@@ -430,6 +474,17 @@ class Solution:
             self.c_x, self.c_T,
             '.-', label=label,
         )
+        color = p[-1].get_color()
+
+        # plot value at left boundary
+        x = np.array([self.p_x[0], self.c_x[0] ])
+        y = np.array([(self.c_T_halo[0] + self.c_T[0]) / 2, self.c_T[0]])
+        ax.plot(x, y, '--', color=color)
+
+        # plot value at right boundary
+        x = np.array([self.c_x[-1], self.p_x[-1]])
+        y = np.array([self.c_T[-1], (self.c_T_halo[-1] + self.c_T[-1]) / 2])
+        ax.plot(x, y, '--', color=color)
 
         ax.set_title('Temp distribution')
         ax.set_xlabel('x-position [m]')
