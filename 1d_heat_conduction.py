@@ -5,6 +5,19 @@ import time
 import matplotlib.pyplot as plt
 
 
+# import mpi if available
+try:
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+except ModuleNotFoundError:
+    comm = None
+    rank = 0
+    size = 1
+
+
 def main():
     # fourier's law
     #
@@ -34,13 +47,21 @@ def main():
     # -------------------------------------------------
 
     # mesh definition
-    n_cells = 1000
+    n_cells = 100
     mesh_points = ((np.cos(np.linspace(np.pi, 0, n_cells+1)) + 1 )/2 )
+    # mesh_points = np.linspace(0, 1, n_cells)
+
+    # split mesh
+    if comm is not None:
+        n = int(n_cells/size)
+        i_start = 0 if rank == 0 else n*rank - 1
+        i_stop = n_cells if rank == size-1 else n*(rank + 1)
+        mesh_points = mesh_points[i_start:i_stop]
 
     # values at mesh-points
     def rad(x):
         left = 1
-        right = 0.1
+        right = 1
         return left - x*(left-right)
     radius = rad(mesh_points)
 
@@ -92,10 +113,14 @@ def main():
     )
 
     # init BCs
-    boundary_conditions = BoundaryConditions(
-        BCs[0][0], BCs[0][1],
-        BCs[1][0], BCs[1][1],
-    )
+    boundary_conditions = BoundaryConditions()
+    if rank == 0:
+        boundary_conditions.left.bc_type = BCs[0][0]
+        boundary_conditions.left.value = BCs[0][1]
+    if rank == size - 1:
+        boundary_conditions.right.bc_type = BCs[1][0]
+        boundary_conditions.right.value = BCs[1][1]
+
 
     # init system
     system = System(
@@ -114,9 +139,10 @@ def main():
         # SolverJacobi(copy.deepcopy(system), max_n, conv_tol),
         # SolverGaussSeidel(copy.deepcopy(system), max_n, conv_tol),
         # SolverThomas(copy.deepcopy(system), max_n, conv_tol),
-        SolverNewton(copy.deepcopy(system), max_n, conv_tol, jac_type='FD'),
+        # SolverNewton(copy.deepcopy(system), max_n, conv_tol, jac_type='FD'),
         SolverNewton(copy.deepcopy(system), max_n, conv_tol, jac_type='FD_col'),
     ]
+
 
     for solver in solvers:
         solver.solve()
@@ -126,31 +152,41 @@ def main():
     # Post Processing
     # -------------------------------------------------
 
-    # plot result
-    fig, axs = plt.subplots(3, 1)
-
-    system.plot_system(axs[0])
-
-    # if possible, plot analytic solution
-    if boundary_conditions.left.bc_type == 'dirichlet' and \
-       boundary_conditions.right.bc_type == 'dirichlet' and \
-       np.all(conductivity == conductivity[0]) and \
-       np.all(radius == radius[0]):
-        plot_analytic(axs[1], BCs, mesh.p_x)
-
-    # Residual + Solution
+    # gather results from all procs
+    solutions = list()
     for solver in solvers:
-        solver.mesh.plot_T(axs[1], label=solver.name)
-        solver.plot_R_hists(axs[2])
-    axs[1].legend()
-    mesh.plot_mesh(axs[1])
-    axs[2].legend()
+        solution = Solution(solver.mesh, BCs)
+        solutions.append(solution)
 
-    # clean up figure
-    fig.set_figwidth(10)
-    fig.set_figheight(10)
-    plt.tight_layout()
-    plt.show()
+    # plot result (do this only on rank 0)
+    if rank == 0:
+        fig, axs = plt.subplots(3, 1)
+
+        solutions[0].plot_system(axs[0])
+
+        # if possible, plot analytic solution
+        if BCs[0][0] == 'dirichlet' and \
+        BCs[1][0] == 'dirichlet' and \
+        np.all(conductivity == conductivity[0]) and \
+        np.all(radius == radius[0]):
+            solutions[0].plot_analytic(axs[1])
+
+        # Residual + Solution
+        for n in range(len(solvers)):
+            solver = solvers[n]
+            solution = solutions[n]
+            solution.plot_T(axs[1], label=solver.name)
+            solver.plot_R_hists(axs[2])
+
+        axs[1].legend()
+        # mesh.plot_mesh(axs[1])
+        axs[2].legend()
+
+        # clean up figure
+        fig.set_figwidth(10)
+        fig.set_figheight(10)
+        plt.tight_layout()
+        plt.show()
 
 
 
@@ -201,35 +237,7 @@ class Mesh:
         # init Solution vector
         self.c_T = np.zeros(self.c_n)
 
-    def plot_mesh(self, ax):
-        # plot mesh
-        mi, ma = ax.get_ylim()
-        y = np.linspace(mi, ma, 2, endpoint=True)
-        for n in self.p_ind:
-            x = np.ones(2) * self.p_x[n]
-            ax.plot(x, y, '--', color='lightgray', zorder=0)
 
-    def plot_T(self, ax, label=None):
-        # plot temp
-        p = ax.plot(
-            self.c_x[self.c_ind], self.c_T[self.c_ind],
-            '.-', label=label,
-        )
-        color = p[-1].get_color()
-
-        # plot value at left boundary
-        x = np.array([self.p_x[1], self.c_x[1] ])
-        y = np.array([(self.c_T[0] + self.c_T[1]) / 2, self.c_T[1]])
-        ax.plot(x, y, '--', color=color)
-
-        # plot value at right boundary
-        x = np.array([self.c_x[-2], self.p_x[-2]])
-        y = np.array([self.c_T[-2], (self.c_T[-1] + self.c_T[-2]) / 2])
-        ax.plot(x, y, '--', color=color)
-
-        ax.set_title('Temp distribution')
-        ax.set_xlabel('x-position [m]')
-        ax.set_ylabel('Temperature [°K]')
 
 
     @staticmethod
@@ -271,16 +279,173 @@ class Mesh:
         return ret_vec
 
 
+
 class BoundaryCondition:
     def __init__(self, bc_type, value):
         self.bc_type = bc_type
         self.value = value
 
 class BoundaryConditions:
-    def __init__(self, left_type, left_value, right_type, right_value):
+    def __init__(self, left_type='halo', left_value=0, right_type='halo', right_value=0):
         self.left = BoundaryCondition(left_type, left_value)
         self.right = BoundaryCondition(right_type, right_value)
 
+
+
+class Solution:
+    def __init__(self, mesh: Mesh, BCs):
+
+        # set BCs
+        self.BCs = BoundaryConditions(
+            BCs[0][0], BCs[0][1],
+            BCs[1][0], BCs[1][1],
+        )
+
+        # figure out sizes of each processor
+        self.exchange_sizes(mesh)
+
+        # gather all the data from all procs
+        self.p_x = self.exchange_p_values(mesh.p_x[mesh.p_ind])
+        self.p_radius = self.exchange_p_values(mesh.p_radius[mesh.p_ind])
+        self.p_conductivity = self.exchange_p_values(mesh.p_conductivity[mesh.p_ind])
+
+
+        self.c_x = self.exchange_c_values(mesh.c_x[mesh.c_ind])
+        self.c_T = self.exchange_c_values(mesh.c_T[mesh.c_ind])
+
+
+    def exchange_sizes(self, mesh):
+        # cancel if MPI ist not available
+        if comm is None:
+            return
+
+        # figure out sizes of cell values
+        local_array = mesh.c_x[mesh.c_ind]
+
+        sendbuf = np.array(local_array)
+        self.c_sendcounts = np.array(comm.gather(len(sendbuf), 0))
+
+        # figure out sizes of pint values
+        local_array = mesh.p_x[mesh.p_ind]
+
+        sendbuf = np.array(local_array)
+        self.p_sendcounts = np.array(comm.gather(len(sendbuf), 0))
+
+    def exchange_p_values(self, array):
+        if comm is None:
+            return array
+
+        if rank == 0:
+            recvbuf = np.empty(sum(self.p_sendcounts))
+        else:
+            recvbuf = np.array([])
+        comm.Gatherv(sendbuf=np.array(array), recvbuf=(recvbuf, self.p_sendcounts), root=0)
+        return recvbuf
+
+    def exchange_c_values(self, array):
+        if comm is None:
+            return array
+
+        if rank == 0:
+            recvbuf = np.empty(sum(self.c_sendcounts))
+        else:
+            recvbuf = np.array([])
+        comm.Gatherv(sendbuf=np.array(array), recvbuf=(recvbuf, self.c_sendcounts), root=0)
+        return recvbuf
+
+
+    def plot_mesh(self, ax):
+        # plot mesh
+        mi, ma = ax.get_ylim()
+        y = np.linspace(mi, ma, 2, endpoint=True)
+        for n in range(len(self.p_x)):
+            x = np.ones(2) * self.p_x[n]
+            ax.plot(x, y, '--', color='lightgray', zorder=0)
+
+    def plot_system(self, ax):
+        # plot rod sizes
+        p = ax.plot(
+            self.p_x,
+            self.p_radius/2,
+            'k'
+        )
+        ax.plot(
+            self.p_x,
+            -self.p_radius/2,
+            color=p[0].get_color()
+        )
+
+        # plot p_conductivity
+        ax_2 = ax.twinx()
+        ax_2.plot(
+            self.p_x,
+            self.p_conductivity
+        )
+
+        # # plot Boundarc conditions
+
+        for i in range(2):
+            # left side
+            BC = self.BCs.left
+
+            # right side
+            if i == 1:
+                BC = self.BCs.right
+
+            text = ''
+            if BC.bc_type == 'dirichlet':
+                text = f'$T = {BC.value} °K$'
+            elif BC.bc_type == 'neumann':
+                text = '$\\frac{dT}{c_dx} = ' + str(BC.value) + \
+                    '°K/m$'
+
+            # left side
+            x = np.min(self.p_x) - 0.01
+            va = 'bottom'
+
+            # right side
+            if i == 1:
+                x = np.max(self.p_x[-1]) + 0.01
+                va = 'top'
+
+            # plot text
+            ax.text(
+                x, 0, text, rotation=90,
+                rotation_mode='anchor',
+                horizontalalignment='center',
+                verticalalignment=va
+            )
+
+        # plot mesh
+        self.plot_mesh(ax)
+
+        ax.set_title('Problem and Mesh definition')
+        ax.set_xlabel('x-position [m]')
+        ax.set_ylabel('y-position [m]')
+        ax_2.set_ylabel('p_conductivity')
+
+    def plot_T(self, ax, label=None):
+        # plot temp
+        p = ax.plot(
+            self.c_x, self.c_T,
+            '.-', label=label,
+        )
+
+        ax.set_title('Temp distribution')
+        ax.set_xlabel('x-position [m]')
+        ax.set_ylabel('Temperature [°K]')
+
+    def plot_analytic(self, ax):
+
+        T_l = self.BCs.left.value
+        T_r = self.BCs.right.value
+
+        l = self.p_x[-1] - self.p_x[0]
+        x = np.linspace(0, l, 100)
+        T = (T_r - T_l) / l * x + T_l
+
+        colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+        ax.plot(x+self.p_x[0], T, '--', color=colors[1], label='Analytic')
 
 
 class System:
@@ -367,6 +532,41 @@ class System:
         return self.B_steady
 
 
+    def exchange_halo_values(self):
+        left_send, left_recv, left_value = None, None, np.zeros(1)
+        right_send, right_recv, right_value = None, None, np.zeros(1)
+
+        test_list = list()
+
+        # send halo data
+        if self.BCs.left.bc_type == 'halo':
+            left_send = comm.Isend(self.mesh.c_T[1], dest=rank-1, tag=1)
+            test_list.append(left_send)
+        if self.BCs.right.bc_type == 'halo':
+            right_send = comm.Isend(self.mesh.c_T[-2], dest=rank+1, tag=2)
+            test_list.append(right_send)
+
+        # receive halo data
+        if self.BCs.right.bc_type == 'halo':
+            right_recv = comm.Irecv(right_value, source=rank+1, tag=1)
+            test_list.append(right_recv)
+        if self.BCs.left.bc_type == 'halo':
+            left_recv = comm.Irecv(left_value, source=rank-1, tag=2)
+            test_list.append(left_recv)
+
+        # wait for communication to finish
+        while len(test_list) > 0:
+            if MPI.Request.Testall(test_list):
+                break
+
+        # Set actual values in halo cells
+        if self.BCs.left.bc_type == 'halo':
+            self.mesh.c_T[0] = left_value[0]
+        if self.BCs.right.bc_type == 'halo':
+            self.mesh.c_T[-1] = right_value[0]
+
+        # print(self.mesh.c_T[0], self.mesh.c_T[-1], rank)
+
     def set_BC_values(self):
         # calc temp in halo cells
         # left side
@@ -414,7 +614,18 @@ class System:
         return R
 
     def calc_res_norm(self):
-        R_norm = np.linalg.norm(self.R)
+        # square the residuals and sum it up
+        R = np.sum(self.R**2)
+
+        # sum the residuals over all processors
+        if comm is not None:
+            R_sum = np.zeros(1)
+            comm.Allreduce(R, R_sum, op=MPI.SUM)
+        else:
+            R_sum = R
+
+        # take the square-root
+        R_norm = np.sqrt(R_sum)
 
         return R_norm
 
@@ -473,67 +684,6 @@ class System:
         return JR
 
 
-    def plot_system(self, ax):
-        # plot rod sizes
-        p = ax.plot(
-            self.mesh.p_x[self.mesh.p_ind],
-            self.mesh.p_radius[self.mesh.p_ind]/2,
-            'k'
-        )
-        ax.plot(
-            self.mesh.p_x[self.mesh.p_ind],
-            -self.mesh.p_radius[self.mesh.p_ind]/2,
-            color=p[0].get_color()
-        )
-
-        # plot p_conductivity
-        ax_2 = ax.twinx()
-        ax_2.plot(
-            self.mesh.p_x[self.mesh.p_ind],
-            self.mesh.p_conductivity[self.mesh.p_ind]
-        )
-
-        # # plot Boundarc conditions
-
-        for i in range(2):
-            # left side
-            BC = self.BCs.left
-
-            # right side
-            if i == 1:
-                BC = self.BCs.right
-
-            text = ''
-            if BC.bc_type == 'dirichlet':
-                text = f'$T = {BC.value} °K$'
-            elif BC.bc_type == 'neumann':
-                text = '$\\frac{dT}{c_dx} = ' + str(BC.value) + \
-                    '°K/m$'
-
-            # left side
-            x = np.min(self.mesh.p_x[self.mesh.p_ind]) - 0.01
-            va = 'bottom'
-
-            # right side
-            if i == 1:
-                x = np.max(self.mesh.p_x[self.mesh.p_ind][-1]) + 0.01
-                va = 'top'
-
-            # plot text
-            ax.text(
-                x, 0, text, rotation=90,
-                rotation_mode='anchor',
-                horizontalalignment='center',
-                verticalalignment=va
-            )
-
-        # plot mesh
-        self.mesh.plot_mesh(ax)
-
-        ax.set_title('Problem and Mesh definition')
-        ax.set_xlabel('x-position [m]')
-        ax.set_ylabel('y-position [m]')
-        ax_2.set_ylabel('p_conductivity')
 
 
 
@@ -572,6 +722,9 @@ class Solver:
             # actually solve
             self.solve_step()
 
+            # exchange halo values
+            self.system.exchange_halo_values()
+
             # update boundary conditions
             self.system.set_BC_values()
             self.system.apply_BCs()
@@ -590,19 +743,25 @@ class Solver:
 
             # cancel loop
             if self.n > self.max_n:
-                print(f'{self.name}: Iteration limit reached.')
+                if rank == 0:
+                    print(f'{self.name}: Iteration limit reached.')
                 break
 
             if self.rel_conv < self.conv_tol:
-                print(f'{self.name}: Converged after {self.n} iterations.')
+                if rank == 0:
+                    print(f'{self.name}: Converged after {self.n} iterations.')
                 break
 
             if self.rel_conv > 1e10:
-                print(f'{self.name}: Numerical method diverged.')
+                if rank == 0:
+                    print(f'{self.name}: Numerical method diverged.')
                 break
 
+        comm.Barrier()
+
         tt = (time.time_ns() - t0) / 1e9
-        print(f'{self.name}: Finished after {tt} seconds.')
+        if rank == 0:
+            print(f'{self.name}: Finished after {tt} seconds.')
 
     def solve_step(self):
         raise NotImplementedError
@@ -709,17 +868,7 @@ class SolverNewton(Solver):
              np.dot(JR_inv, self.system.R)
 
 
-def plot_analytic(ax, BCs, mesh_h):
 
-    T_l = BCs[0][1]
-    T_r = BCs[1][1]
-
-    l = mesh_h[-2] - mesh_h[1]
-    x = np.linspace(0, l, 100)
-    T = (T_r - T_l) / l * x + T_l
-
-    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    ax.plot(x+mesh_h[1], T, '--', color=colors[1], label='Analytic')
 
 
 
